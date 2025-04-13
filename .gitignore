@@ -4,5 +4,4 @@ atp-cyto_FusionStitcher_F0.ims:Zone.Identifier
 atp-cyto_FusionStitcher_F1.ims:Zone.Identifier
 cell_crops/
 cell_analysis_results/
-atp.ims
-control.ims
+*.ims
