@@ -15,7 +15,8 @@ def segment_track_analyze_tif(tif_path, output_dir=None, ref_channel=1, meas_cha
                            use_adaptive=True, adaptive_block_size=35, 
                            use_watershed=True, watershed_min_distance=10,
                            percentile_low=0.1, percentile_high=99.9,
-                           bleach_correction=True, bleach_model='exponential'):
+                           bleach_correction=True, bleach_model='exponential',
+                           baseline_frames=None):
     """
     Segment, track, and analyze cells in a time-lapse TIF file.
     
@@ -47,6 +48,9 @@ def segment_track_analyze_tif(tif_path, output_dir=None, ref_channel=1, meas_cha
         Whether to apply bleaching correction (default: True)
     bleach_model : str
         Type of bleaching model ('exponential', 'linear', 'polynomial')
+    baseline_frames : int or None
+        Number of initial frames to use as baseline for ratio normalization.
+        If provided, ratio values will be normalized to the average of these frames.
     """
     # Create timestamp and output directory
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -445,7 +449,12 @@ def segment_track_analyze_tif(tif_path, output_dir=None, ref_channel=1, meas_cha
         # Replace original DataFrame
         df = df_corrected
     
-    # Step 6: Filter cells that leave field of view
+    # Step 6: Apply baseline normalization if requested
+    if baseline_frames is not None and baseline_frames > 0 and baseline_frames < num_frames and not df.empty:
+        print(f"\nNormalizing ratio values to first {baseline_frames} frames...")
+        df = normalize_to_baseline(df, baseline_frames, bleach_correction)
+    
+    # Step 7: Filter cells that leave field of view
     in_view_cells = [cell_id for cell_id, track in cell_tracks.items() if track['in_view']]
     
     # Filter to only keep cells visible through all frames
@@ -468,10 +477,10 @@ def segment_track_analyze_tif(tif_path, output_dir=None, ref_channel=1, meas_cha
     df.to_csv(os.path.join(output_dir, f"{file_name}_all_cells_data.csv"), index=False)
     df_filtered.to_csv(os.path.join(output_dir, f"{file_name}_tracked_cells_data.csv"), index=False)
     
-    # Step 7: Generate analysis plots
+    # Step 8: Generate analysis plots
     print("\nGenerating analysis plots...")
     
-    # Create ratio and channel plots
+    # Create plots
     if not df_filtered.empty:
         # 1. Ratio plots
         create_ratio_plot(df_filtered, corrected=False, output_dir=output_dir, file_name=file_name)
@@ -482,7 +491,11 @@ def segment_track_analyze_tif(tif_path, output_dir=None, ref_channel=1, meas_cha
         # 2. Channel intensity plots
         create_channel_plots(df_filtered, bleach_correction, output_dir, file_name)
         
-        # 3. Create cell tracking visualization
+        # 3. Create normalized ratio plots if baseline normalization was applied
+        if baseline_frames is not None and 'ratio_normalized' in df_filtered.columns:
+            create_normalized_ratio_plot(df_filtered, bleach_correction, output_dir, file_name, baseline_frames)
+        
+        # 4. Create cell tracking visualization
         create_tracking_visualization(master_labels, cell_tracks, full_track_cells, output_dir, file_name)
     else:
         print("Warning: No cell data available for plotting.")
@@ -603,6 +616,53 @@ def apply_bleaching_correction(df, model_type='exponential', poly_order=2, norma
     return df_corrected, model_params, correction_factors
 
 
+def normalize_to_baseline(df, baseline_frames, bleach_correction=True):
+    """
+    Normalize ratio values to the average of the first baseline_frames
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        DataFrame with cell measurements
+    baseline_frames : int
+        Number of initial frames to use as baseline
+    bleach_correction : bool
+        Whether bleaching correction was applied
+        
+    Returns:
+    --------
+    df_normalized : pandas.DataFrame
+        DataFrame with normalized ratio values
+    """
+    # Create a copy of the DataFrame
+    df_normalized = df.copy()
+    
+    # Normalize each cell individually
+    for cell_id in df_normalized['cell_id'].unique():
+        cell_df = df_normalized[df_normalized['cell_id'] == cell_id]
+        
+        # Get baseline frames for this cell
+        baseline_df = cell_df[cell_df['time_point'] < baseline_frames]
+        
+        if len(baseline_df) > 0:
+            # Calculate baseline average for the original ratio
+            baseline_avg = baseline_df['ratio'].mean()
+            if baseline_avg > 0:
+                # Apply normalization
+                df_normalized.loc[df_normalized['cell_id'] == cell_id, 'ratio_normalized'] = \
+                    df_normalized.loc[df_normalized['cell_id'] == cell_id, 'ratio'] / baseline_avg
+            
+            # Also normalize corrected ratio if available
+            if bleach_correction and 'ratio_corrected' in cell_df.columns:
+                baseline_avg_corrected = baseline_df['ratio_corrected'].mean()
+                if baseline_avg_corrected > 0:
+                    # Apply normalization
+                    df_normalized.loc[df_normalized['cell_id'] == cell_id, 'ratio_corrected_normalized'] = \
+                        df_normalized.loc[df_normalized['cell_id'] == cell_id, 'ratio_corrected'] / baseline_avg_corrected
+    
+    return df_normalized
+
+
 def create_ratio_plot(df, corrected=False, output_dir='.', file_name='output'):
     """Create plot of measurement/reference ratio over time"""
     plt.figure(figsize=(12, 8))
@@ -619,7 +679,8 @@ def create_ratio_plot(df, corrected=False, output_dir='.', file_name='output'):
         title_suffix = 'Uncorrected'
     
     mean_ratios = time_groups[ratio_column].mean()
-    std_ratios = time_groups[ratio_column].std()
+    counts = time_groups[ratio_column].count()
+    std_ratios = time_groups[ratio_column].std() / np.sqrt(counts)
     
     # Plot with error bars
     plt.errorbar(mean_ratios.index, mean_ratios, yerr=std_ratios, 
@@ -645,10 +706,12 @@ def create_channel_plots(df, bleach_correction, output_dir='.', file_name='outpu
     
     # Calculate stats for each channel
     mean_ref = time_groups['reference_intensity'].mean()
-    std_ref = time_groups['reference_intensity'].std()
+    counts_ref = time_groups['reference_intensity'].count()
+    std_ref = time_groups['reference_intensity'].std() / np.sqrt(counts_ref)
     
     mean_meas = time_groups['measurement_intensity'].mean()
-    std_meas = time_groups['measurement_intensity'].std()
+    counts_meas = time_groups['measurement_intensity'].count()
+    std_meas = time_groups['measurement_intensity'].std() / np.sqrt(counts_meas)
     
     # Plot reference channel
     plt.errorbar(mean_ref.index, mean_ref, yerr=std_ref, 
@@ -658,7 +721,7 @@ def create_channel_plots(df, bleach_correction, output_dir='.', file_name='outpu
     # If bleach correction applied, also plot corrected reference
     if bleach_correction and 'reference_intensity_corrected' in df.columns:
         mean_ref_corr = time_groups['reference_intensity_corrected'].mean()
-        std_ref_corr = time_groups['reference_intensity_corrected'].std()
+        std_ref_corr = time_groups['reference_intensity_corrected'].std() / np.sqrt(counts_ref)
         
         plt.errorbar(mean_ref_corr.index, mean_ref_corr, yerr=std_ref_corr, 
                    fmt='o-', linewidth=2, capsize=4, 
@@ -678,6 +741,54 @@ def create_channel_plots(df, bleach_correction, output_dir='.', file_name='outpu
     
     # Save the plot
     plt.savefig(os.path.join(output_dir, f"{file_name}_channel_intensities.png"))
+    plt.close()
+
+
+def create_normalized_ratio_plot(df, bleach_correction, output_dir='.', file_name='output', baseline_frames=None):
+    """Create plots of normalized ratio values"""
+    plt.figure(figsize=(12, 8))
+    
+    # Group by time point
+    time_groups = df.groupby('time_point')
+    
+    # Calculate stats for normalized ratio
+    mean_ratio_norm = time_groups['ratio_normalized'].mean()
+    counts_norm = time_groups['ratio_normalized'].count()
+    std_ratio_norm = time_groups['ratio_normalized'].std() / np.sqrt(counts_norm)
+    
+    # Plot normalized ratio
+    plt.errorbar(mean_ratio_norm.index, mean_ratio_norm, yerr=std_ratio_norm, 
+               fmt='o-', linewidth=2, capsize=4, 
+               label='Normalized Ratio', color='green')
+    
+    # Also plot corrected normalized ratio if available
+    if bleach_correction and 'ratio_corrected_normalized' in df.columns:
+        mean_ratio_corr_norm = time_groups['ratio_corrected_normalized'].mean()
+        counts_corr_norm = time_groups['ratio_corrected_normalized'].count()
+        std_ratio_corr_norm = time_groups['ratio_corrected_normalized'].std() / np.sqrt(counts_corr_norm)
+        
+        plt.errorbar(mean_ratio_corr_norm.index, mean_ratio_corr_norm, yerr=std_ratio_corr_norm, 
+                   fmt='o-', linewidth=2, capsize=4, 
+                   label='Normalized Corrected Ratio', color='purple')
+    
+    # Add vertical line at baseline/treatment transition if specified
+    if baseline_frames is not None:
+        plt.axvline(x=baseline_frames-0.5, color='red', linestyle='--', 
+                  label='Baseline → Treatment')
+    
+    plt.title(f'Normalized Ratio Values (Baseline: First {baseline_frames} Frames)', fontsize=14)
+    plt.xlabel('Time Point', fontsize=12)
+    plt.ylabel('Normalized Ratio (Relative to Baseline)', fontsize=12)
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    
+    # Draw horizontal line at y=1.0 to indicate baseline level
+    plt.axhline(y=1.0, color='gray', linestyle='-', alpha=0.5)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    plt.savefig(os.path.join(output_dir, f"{file_name}_normalized_ratio.png"))
     plt.close()
 
 
@@ -797,7 +908,15 @@ if __name__ == "__main__":
     percentile_high = 99.9
     bleach_correction = True
     
-    print("\nUsing automatic settings:")
+    # Ask if user wants to use baseline normalization
+    try:
+        baseline_input = input("Enter number of baseline frames (or press Enter to skip normalization): ")
+        baseline_frames = int(baseline_input) if baseline_input.strip() else None
+    except ValueError:
+        print("Invalid input. Proceeding without baseline normalization.")
+        baseline_frames = None
+    
+    print("\nUsing settings:")
     print(f"  Reference channel: {ref_channel}")
     print(f"  Measurement channel: {meas_channel}")
     print(f"  Minimum cell size: {min_cell_size} pixels")
@@ -805,6 +924,7 @@ if __name__ == "__main__":
     print(f"  Watershed segmentation: Enabled (min distance {watershed_min_distance})")
     print(f"  Contrast enhancement: {percentile_low} to {percentile_high} percentiles")
     print(f"  Bleach correction: {'Enabled' if bleach_correction else 'Disabled'}")
+    print(f"  Baseline normalization: {'First ' + str(baseline_frames) + ' frames' if baseline_frames else 'Disabled'}")
     print()
     
     # Run the analysis
@@ -813,4 +933,5 @@ if __name__ == "__main__":
                            use_adaptive=use_adaptive, adaptive_block_size=adaptive_block_size,
                            use_watershed=use_watershed, watershed_min_distance=watershed_min_distance,
                            percentile_low=percentile_low, percentile_high=percentile_high,
-                           bleach_correction=bleach_correction)
+                           bleach_correction=bleach_correction,
+                           baseline_frames=baseline_frames)
