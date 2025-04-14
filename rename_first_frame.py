@@ -1,345 +1,402 @@
 import numpy as np
 import tifffile
-from skimage import filters, measure, exposure
-from scipy import ndimage
 import matplotlib.pyplot as plt
-import os
+from skimage import filters, morphology, measure, segmentation, feature
+from skimage.exposure import rescale_intensity
 from pathlib import Path
-import datetime
+import os
+import pandas as pd
+import argparse
 
-def segment_first_frame(tif_path, ref_channel=1, min_cell_size=100, 
-                        percentile_low=0.5, percentile_high=99.5,
-                        threshold_method='otsu', use_adaptive=False, 
-                        use_watershed=True, watershed_min_distance=15,
-                        adaptive_block_size=35):
+def load_first_frame(tiff_path, channel=0):
     """
-    Simple script to segment the first frame of a TIF file.
+    Load the first frame from a TIFF file, extracting a specific channel.
     
     Parameters:
     -----------
-    tif_path : str
-        Path to the TIF file to analyze
-    ref_channel : int
-        Index of the reference channel (default: 1)
-    min_cell_size : int
-        Minimum size of cells to consider (default: 100)
-    percentile_low, percentile_high : float
-        Percentiles for contrast enhancement (default: 0.5, 99.5)
-    threshold_method : str or float
-        Method for thresholding ('otsu', 'li') or a manual value (default: 'otsu')
-    use_adaptive : bool
-        Whether to use adaptive thresholding (default: False)
-    use_watershed : bool
-        Whether to use watershed segmentation (default: True)
-    watershed_min_distance : int
-        Minimum distance between peaks for watershed (default: 15)
-    adaptive_block_size : int
-        Block size for adaptive thresholding (default: 35)
+    tiff_path : str
+        Path to the TIFF file
+    channel : int
+        Channel index to extract
+    
+    Returns:
+    --------
+    image : numpy.ndarray
+        First frame, single channel image
     """
-    # Extract filename for outputs
-    file_name = Path(tif_path).stem
-    current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Create output directory
-    output_dir = f'segmentation_output_{current_time}'
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
-    print(f"Loading TIF file: {tif_path}")
-    
-    # Step 1: Load the TIF file
-    try:
-        tif_data = tifffile.imread(tif_path)
-        print(f"TIF data shape: {tif_data.shape}")
-    except Exception as e:
-        print(f"Error loading file: {e}")
-        return
-    
-    # Step 2: Extract first frame and reference channel
-    # Handle different dimension formats
-    first_frame = None
-    
-    # Try to determine dimensionality and extract first frame's reference channel
-    try:
-        if len(tif_data.shape) == 5:  # TZCYX format
-            first_frame = tif_data[0, 0, ref_channel, :, :]
-            print(f"Extracted from 5D format (TZCYX)")
-        elif len(tif_data.shape) == 4:
-            if tif_data.shape[2] <= 5:  # Likely TZYX with small Z dimension
-                first_frame = tif_data[0, 0, :, :]
-                print(f"Extracted from 4D format (TZYX)")
-            else:  # Likely TCYX with C > Z
-                first_frame = tif_data[0, ref_channel, :, :]
-                print(f"Extracted from 4D format (TCYX)")
-        elif len(tif_data.shape) == 3:
-            if tif_data.shape[2] <= 5:  # Likely YXC format
-                first_frame = tif_data[:, :, ref_channel]
-                print(f"Extracted from 3D format (YXC)")
-            else:  # Likely TYX format
-                first_frame = tif_data[0, :, :]
-                print(f"Extracted from 3D format (TYX)")
-        else:
-            first_frame = tif_data
-            print(f"Using as-is - shape: {first_frame.shape}")
-            
-        print(f"First frame shape: {first_frame.shape}")
+    with tifffile.TiffFile(tiff_path) as tif:
+        metadata = tif.imagej_metadata
+        axes = metadata.get('axes', 'TZCYX')
         
-        # Save the raw image
-        plt.figure(figsize=(10, 8))
-        plt.imshow(first_frame, cmap='gray')
-        plt.colorbar(label='Intensity')
-        plt.title('Raw Reference Channel - First Frame')
-        plt.savefig(os.path.join(output_dir, f"{file_name}_raw.png"))
-        plt.close()
-        
-    except Exception as e:
-        print(f"Error extracting first frame: {e}")
-        
-        # Try alternate formats if the standard ones fail
-        try:
-            # Just take the first slice of whatever we have
-            if len(tif_data.shape) > 2:
-                first_frame = tif_data[0]
-                if len(first_frame.shape) > 2 and first_frame.shape[-1] > 1:
-                    # This might be channel data
-                    ref_idx = min(ref_channel, first_frame.shape[-1] - 1)
-                    first_frame = first_frame[..., ref_idx]
-            else:
-                first_frame = tif_data
+        # Read the first timepoint
+        if 'T' in axes and axes.startswith('T'):
+            # For TZCYX format
+            if len(axes) >= 5 and 'C' in axes:
+                c_idx = axes.index('C')
+                image = tif.asarray(0)  # First timepoint
                 
-            print(f"Using alternate extraction, shape: {first_frame.shape}")
-            
-            # Save the raw image
-            plt.figure(figsize=(10, 8))
-            plt.imshow(first_frame, cmap='gray')
-            plt.colorbar(label='Intensity')
-            plt.title('Raw Reference Channel - First Frame (Alternative Format)')
-            plt.savefig(os.path.join(output_dir, f"{file_name}_raw_alt.png"))
-            plt.close()
-            
-        except Exception as e2:
-            print(f"Error with alternate extraction: {e2}")
-            return
+                # Get the correct channel
+                channel_idx = min(channel, image.shape[c_idx-1]-1)
+                
+                # Handle different dimensions
+                if image.ndim == 5:  # TZCYX (we've already sliced T)
+                    image = image[0, channel_idx]  # Take first Z, requested channel
+                elif image.ndim == 4:  # TZYX or TCYX
+                    if 'Z' in axes:
+                        image = image[0, channel_idx]  # Take first Z, requested channel
+                    else:
+                        image = image[channel_idx]  # Take requested channel
+                elif image.ndim == 3:  # TZX or TCX
+                    image = image[channel_idx]  # Take requested channel
+            else:
+                # No channel dimension
+                image = tif.asarray(0)  # First timepoint
+                if image.ndim > 2:
+                    image = image[0]  # Take first Z
+        else:
+            # No time dimension, just read first page
+            image = tif.asarray()
+            if image.ndim > 2:
+                if len(axes) >= 3 and 'C' in axes:
+                    c_idx = axes.index('C')
+                    channel_idx = min(channel, image.shape[c_idx-1]-1)
+                    slices = [0] * image.ndim
+                    slices[c_idx-1] = channel_idx
+                    image = image[tuple(slices)]
+                else:
+                    image = image[0]  # Take first Z or channel
     
-    # Check if we have a valid image
-    if first_frame is None or first_frame.size == 0:
-        print("Failed to extract a valid frame from the TIF file.")
+    # Ensure 2D
+    if image.ndim > 2:
+        image = image.reshape(image.shape[-2], image.shape[-1])
+    
+    return image
+
+def segment_cells(image, min_distance=10, footprint_size=5, threshold_method='otsu', 
+                  min_size=20, apply_watershed=True, sigma=1.0, contrast_enhance=True):
+    """
+    Segment cells or particles in a fluorescence microscopy image.
+    
+    Parameters:
+    -----------
+    image : numpy.ndarray
+        Input image
+    min_distance : int
+        Minimum distance between peaks in peak detection
+    footprint_size : int
+        Size of the local footprint for peak detection
+    threshold_method : str
+        Method for thresholding ('otsu', 'adaptive', or 'li')
+    min_size : int
+        Minimum size of objects to keep
+    apply_watershed : bool
+        Whether to apply watershed segmentation
+    sigma : float
+        Sigma for Gaussian filtering
+    contrast_enhance : bool
+        Whether to enhance contrast before processing
+        
+    Returns:
+    --------
+    labels : numpy.ndarray
+        Labeled segmentation mask
+    props : list
+        Region properties for each labeled object
+    """
+    # Normalize and enhance contrast if needed
+    if contrast_enhance:
+        p2, p98 = np.percentile(image, (2, 98))
+        image = rescale_intensity(image, in_range=(p2, p98))
+    
+    # Apply Gaussian filter to reduce noise
+    smoothed = filters.gaussian(image, sigma=sigma)
+    
+    # Thresholding
+    if threshold_method == 'otsu':
+        thresh = filters.threshold_otsu(smoothed)
+    elif threshold_method == 'adaptive':
+        thresh = filters.threshold_local(smoothed, block_size=51)
+    elif threshold_method == 'li':
+        thresh = filters.threshold_li(smoothed)
+    else:
+        thresh = filters.threshold_otsu(smoothed)
+    
+    # Create binary mask
+    binary = smoothed > thresh
+    
+    # Clean up binary image
+    binary = morphology.remove_small_holes(binary, area_threshold=min_size*2)
+    binary = morphology.remove_small_objects(binary, min_size=min_size)
+    
+    # Refine segmentation
+    if apply_watershed:
+        # Distance transform for watershed
+        distance = morphology.distance_transform_edt(binary)
+        
+        # Find local maxima (peaks)
+        footprint = morphology.disk(footprint_size)
+        peaks = feature.peak_local_max(
+            distance, 
+            min_distance=min_distance,
+            footprint=footprint,
+            labels=binary
+        )
+        
+        # Create markers for watershed
+        markers = np.zeros_like(distance, dtype=int)
+        markers[tuple(peaks.T)] = np.arange(1, len(peaks) + 1)
+        
+        # Apply watershed
+        labels = segmentation.watershed(-distance, markers, mask=binary)
+    else:
+        # Use connected components if not using watershed
+        labels = measure.label(binary)
+    
+    # Remove small objects again
+    labels = morphology.remove_small_objects(labels, min_size=min_size)
+    
+    # Calculate properties of labeled regions
+    props = measure.regionprops(labels, intensity_image=image)
+    
+    return labels, props
+
+def plot_segmentation(image, labels, props, output_path=None, figsize=(12, 12), 
+                      n_clusters=5, cmap='viridis'):
+    """
+    Plot segmentation results with colored labels and save to file.
+    
+    Parameters:
+    -----------
+    image : numpy.ndarray
+        Original input image
+    labels : numpy.ndarray
+        Labeled segmentation mask
+    props : list
+        Region properties for each labeled object
+    output_path : str or None
+        Path to save the output figure
+    figsize : tuple
+        Figure size
+    n_clusters : int
+        Number of clusters to group objects by intensity
+    cmap : str
+        Colormap name
+    """
+    # Extract mean intensities from props
+    if len(props) == 0:
+        print("No objects found in segmentation")
         return
     
-    # Step 3: Preprocess the image
-    print("Preprocessing image...")
+    intensities = np.array([prop.mean_intensity for prop in props])
     
-    # Apply Gaussian smoothing
-    smoothed = filters.gaussian(first_frame, sigma=2.0)
-    print(f"Smoothed image min/max: {np.min(smoothed)}/{np.max(smoothed)}")
-    
-    # Enhance contrast
-    p_low, p_high = np.percentile(smoothed, (percentile_low, percentile_high))
-    print(f"Contrast stretch range: {p_low} to {p_high}")
-    
-    reference_enhanced = exposure.rescale_intensity(smoothed, in_range=(p_low, p_high))
-    print(f"Enhanced image min/max: {np.min(reference_enhanced)}/{np.max(reference_enhanced)}")
-    
-    # Save the enhanced image
-    plt.figure(figsize=(10, 8))
-    plt.imshow(reference_enhanced, cmap='gray')
-    plt.colorbar(label='Enhanced Intensity')
-    plt.title('Enhanced Reference Channel')
-    plt.savefig(os.path.join(output_dir, f"{file_name}_enhanced.png"))
-    plt.close()
-    
-    # Step 4: Apply threshold
-    print("Applying threshold...")
-    
-    # Different thresholding approaches
-    if use_adaptive:
-        # Adaptive thresholding for uneven illumination
-        from skimage.filters import threshold_local
-        print(f"Using adaptive thresholding with block size {adaptive_block_size}")
-        local_thresh = threshold_local(reference_enhanced, block_size=adaptive_block_size)
-        binary = reference_enhanced > local_thresh
+    # Create clusters based on intensities
+    if len(intensities) >= n_clusters:
+        # Use quantiles for clustering
+        thresholds = np.percentile(intensities, np.linspace(0, 100, n_clusters+1)[1:-1])
+        clusters = np.zeros(len(intensities), dtype=int)
+        
+        for i, threshold in enumerate(thresholds):
+            clusters[intensities > threshold] = i + 1
     else:
-        # Global thresholding
-        if threshold_method == 'otsu':
-            thresh = filters.threshold_otsu(reference_enhanced)
-        elif threshold_method == 'li':
-            thresh = filters.threshold_li(reference_enhanced)
-        elif threshold_method == 'triangle':
-            thresh = filters.threshold_triangle(reference_enhanced)
-        elif threshold_method == 'yen':
-            thresh = filters.threshold_yen(reference_enhanced)
-        else:
-            try:
-                # Try to interpret as a float value
-                thresh = float(threshold_method)
-            except (ValueError, TypeError):
-                print("Invalid threshold method, using Otsu's method")
-                thresh = filters.threshold_otsu(reference_enhanced)
+        # Not enough objects for requested clusters
+        clusters = np.zeros(len(intensities), dtype=int)
+    
+    # Define colors for clusters
+    cluster_colors = plt.cm.get_cmap('tab10', n_clusters)
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Display original image
+    ax.imshow(image, cmap='gray')
+    
+    # Create colored labels based on clusters
+    for i, prop in enumerate(props):
+        y, x = prop.centroid
+        label = prop.label
+        cluster = clusters[i]
+        color = cluster_colors(cluster)
         
-        print(f"Threshold value: {thresh}")
-        binary = reference_enhanced > thresh
+        # Draw text with colored background based on cluster
+        ax.text(x, y, str(label), color='white', fontsize=8, 
+                ha='center', va='center', 
+                bbox=dict(facecolor=color, alpha=0.7, edgecolor='none', pad=1))
     
-    # Save the initial binary mask
-    plt.figure(figsize=(10, 8))
-    plt.imshow(binary, cmap='gray')
-    plt.title('Initial Binary Mask (Before Cleanup)')
-    plt.savefig(os.path.join(output_dir, f"{file_name}_initial_binary.png"))
-    plt.close()
+    ax.set_title('First Frame Segmentation')
+    ax.axis('on')
     
-    # Step 5: Clean up the binary mask
-    print("Cleaning up binary mask...")
+    # Save figure if output_path is provided
+    if output_path:
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Segmentation image saved to: {output_path}")
     
-    # Apply morphological operations
-    binary = ndimage.binary_fill_holes(binary)
-    binary = ndimage.binary_closing(binary, iterations=3)
-    binary = ndimage.binary_opening(binary, iterations=2)
-    binary = ndimage.binary_fill_holes(binary)
-    binary = ndimage.binary_opening(binary, structure=np.ones((3,3)))
+    plt.close(fig)
     
-    # Save the cleaned binary mask
-    plt.figure(figsize=(10, 8))
-    plt.imshow(binary, cmap='gray')
-    plt.title('Cleaned Binary Mask')
-    plt.savefig(os.path.join(output_dir, f"{file_name}_cleaned_binary.png"))
-    plt.close()
+    return fig
+
+def save_segmentation_data(props, output_csv=None):
+    """
+    Save segmentation data to CSV file.
     
-    # Step 6: Label regions
-    print("Labeling and filtering regions...")
+    Parameters:
+    -----------
+    props : list
+        Region properties for each labeled object
+    output_csv : str or None
+        Path to save the output CSV file
     
-    # Watershed segmentation to separate close cells
-    if use_watershed:
-        from scipy import ndimage as ndi
-        from skimage.feature import peak_local_max
-        
-        print(f"Applying watershed segmentation with min_distance={watershed_min_distance}")
-        
-        # Compute the distance map
-        distance = ndi.distance_transform_edt(binary)
-        
-        # Find local maxima (cell centers)
-        try:
-            # Try with indices=False first (newer versions)
-            local_max_coords = peak_local_max(distance, min_distance=watershed_min_distance,
-                                          labels=binary)
-            # Convert coordinates to mask
-            local_max = np.zeros_like(binary, dtype=bool)
-            for coord in local_max_coords:
-                local_max[tuple(coord)] = True
-        except TypeError:
-            # Older versions might return coordinates directly
-            print("Using alternative peak_local_max method")
-            local_max_coords = peak_local_max(distance, min_distance=watershed_min_distance, 
-                                          labels=binary)
-            # Convert coordinates to mask
-            local_max = np.zeros_like(binary, dtype=bool)
-            for coord in local_max_coords:
-                local_max[coord[0], coord[1]] = True
-        
-        # Mark each local maximum with a unique label
-        markers = measure.label(local_max)
-        
-        # Apply watershed to find cell boundaries
-        from skimage import segmentation
-        labels = segmentation.watershed(-distance, markers, mask=binary)
-        
-        print(f"Watershed segmentation found {len(np.unique(labels)) - 1} regions")
-    else:
-        # Standard connected component labeling
-        labels = measure.label(binary)
-        print(f"Connected component labeling found {len(np.unique(labels)) - 1} regions")
+    Returns:
+    --------
+    df : pandas.DataFrame
+        DataFrame with segmentation data
+    """
+    if len(props) == 0:
+        print("No objects found in segmentation")
+        return pd.DataFrame()
     
-    # Get region properties
-    props = measure.regionprops(labels, first_frame)
-    
-    print(f"Found {len(props)} initial regions")
-    
-    # Filter regions based on criteria
-    valid_labels = []
+    # Extract properties
+    data = []
     for prop in props:
-        # Simple size-based filtering
-        if prop.area >= min_cell_size and prop.area <= min_cell_size * 10:
-            valid_labels.append(prop.label)
+        y, x = prop.centroid
+        data.append({
+            'label': prop.label,
+            'x': x,
+            'y': y,
+            'area': prop.area,
+            'perimeter': prop.perimeter,
+            'eccentricity': prop.eccentricity,
+            'mean_intensity': prop.mean_intensity,
+            'max_intensity': prop.max_intensity,
+            'min_intensity': prop.min_intensity
+        })
     
-    print(f"Found {len(valid_labels)} valid cells after size filtering")
+    # Convert to DataFrame
+    df = pd.DataFrame(data)
     
-    # Create filtered labels for visualization
-    filtered_labels = np.zeros_like(labels)
-    for label in valid_labels:
-        filtered_labels[labels == label] = label
+    # Save to CSV if output_csv is provided
+    if output_csv:
+        df.to_csv(output_csv, index=False)
+        print(f"Segmentation data saved to: {output_csv}")
     
-    # Step 7: Visualize the segmentation results
+    return df
+
+def process_tiff_file(tiff_path, output_dir=None, channel=0, **segmentation_params):
+    """
+    Process a single TIFF file and generate segmentation results.
     
-    # Create segmentation mask
-    plt.figure(figsize=(12, 10))
+    Parameters:
+    -----------
+    tiff_path : str
+        Path to the TIFF file
+    output_dir : str or None
+        Directory to save output files
+    channel : int
+        Channel index to process
+    **segmentation_params : dict
+        Additional parameters for segmentation
     
-    # Use a discrete colormap with enough colors
-    from matplotlib.colors import ListedColormap
-    num_labels = len(valid_labels) + 1  # +1 for background
-    cmap = plt.cm.get_cmap('nipy_spectral', num_labels)
+    Returns:
+    --------
+    results : dict
+        Dictionary with segmentation results
+    """
+    # Create output directory if needed
+    if output_dir is None:
+        output_dir = os.path.dirname(tiff_path)
+    os.makedirs(output_dir, exist_ok=True)
     
-    plt.imshow(filtered_labels, cmap=cmap)
-    plt.colorbar(label='Cell ID')
-    plt.title('Cell Segmentation Mask')
-    plt.savefig(os.path.join(output_dir, f"{file_name}_segmentation_mask.png"))
-    plt.close()
+    # Get file name without extension
+    file_stem = Path(tiff_path).stem
     
-    # Create overlay of the segmentation on the original image
-    plt.figure(figsize=(12, 10))
-    plt.imshow(first_frame, cmap='gray')
+    # Load first frame
+    print(f"Loading first frame from {tiff_path}, channel {channel}")
+    image = load_first_frame(tiff_path, channel=channel)
     
-    # Create a semi-transparent overlay
-    masked_labels = np.ma.masked_where(filtered_labels == 0, filtered_labels)
-    plt.imshow(masked_labels, cmap=cmap, alpha=0.5)
+    if image is None or image.size == 0:
+        print(f"Failed to load image from {tiff_path}")
+        return None
     
-    # Add cell ID labels to each cell
-    for label in valid_labels:
-        # Get centroid of this cell
-        props = measure.regionprops(np.asarray(filtered_labels == label, dtype=int))
-        if props:
-            y, x = props[0].centroid
-            plt.text(x, y, str(label), color='white', 
-                   fontsize=8, ha='center', va='center',
-                   bbox=dict(facecolor='black', alpha=0.5, pad=1))
+    # Segment cells
+    print("Segmenting objects...")
+    labels, props = segment_cells(image, **segmentation_params)
     
-    plt.title('Segmentation Overlay on Original Image')
-    plt.savefig(os.path.join(output_dir, f"{file_name}_segmentation_overlay.png"))
-    plt.close()
+    # Define output paths
+    img_output = os.path.join(output_dir, f"{file_stem}_segmentation.png")
+    csv_output = os.path.join(output_dir, f"{file_stem}_segmentation.csv")
     
-    print(f"Segmentation complete. Results saved to {output_dir}")
-    return filtered_labels, first_frame
+    # Plot segmentation
+    print("Plotting segmentation...")
+    plot_segmentation(image, labels, props, output_path=img_output)
+    
+    # Save segmentation data
+    print("Saving segmentation data...")
+    df = save_segmentation_data(props, output_csv=csv_output)
+    
+    results = {
+        'image': image,
+        'labels': labels,
+        'props': props,
+        'df': df,
+        'img_output': img_output,
+        'csv_output': csv_output,
+        'n_objects': len(props)
+    }
+    
+    print(f"Segmentation complete. Found {len(props)} objects.")
+    return results
+
+def main():
+    parser = argparse.ArgumentParser(description='Segment objects in the first frame of a TIFF file')
+    parser.add_argument('tiff_path', type=str, help='Path to TIFF file')
+    parser.add_argument('--output-dir', type=str, default=None, help='Output directory')
+    parser.add_argument('--channel', type=int, default=0, help='Channel to process')
+    parser.add_argument('--min-distance', type=int, default=10, help='Minimum distance between peaks')
+    parser.add_argument('--footprint-size', type=int, default=5, help='Size of footprint for peak detection')
+    parser.add_argument('--threshold-method', type=str, default='otsu', 
+                        choices=['otsu', 'adaptive', 'li'], help='Thresholding method')
+    parser.add_argument('--min-size', type=int, default=20, help='Minimum object size')
+    parser.add_argument('--sigma', type=float, default=1.0, help='Sigma for Gaussian filtering')
+    parser.add_argument('--no-watershed', action='store_false', dest='apply_watershed', 
+                        help='Disable watershed segmentation')
+    parser.add_argument('--no-contrast-enhance', action='store_false', dest='contrast_enhance',
+                        help='Disable contrast enhancement')
+    parser.add_argument('--batch', action='store_true', help='Process all TIFF files in a directory')
+    
+    args = parser.parse_args()
+    
+    segmentation_params = {
+        'min_distance': args.min_distance,
+        'footprint_size': args.footprint_size,
+        'threshold_method': args.threshold_method,
+        'min_size': args.min_size,
+        'apply_watershed': args.apply_watershed,
+        'sigma': args.sigma,
+        'contrast_enhance': args.contrast_enhance
+    }
+    
+    if args.batch:
+        # Process all TIFF files in directory
+        tiff_dir = args.tiff_path  # In batch mode, tiff_path is a directory
+        output_dir = args.output_dir or tiff_dir
+        
+        for tiff_file in Path(tiff_dir).glob('*.tif'):
+            try:
+                process_tiff_file(
+                    str(tiff_file),
+                    output_dir=output_dir,
+                    channel=args.channel,
+                    **segmentation_params
+                )
+            except Exception as e:
+                print(f"Error processing {tiff_file}: {e}")
+    else:
+        # Process single file
+        process_tiff_file(
+            args.tiff_path,
+            output_dir=args.output_dir,
+            channel=args.channel,
+            **segmentation_params
+        )
 
 if __name__ == "__main__":
-    print("Simple TIF First Frame Segmentation")
-    print("===================================")
-    
-    # Get input from user
-    tif_path = input("Enter path to TIF file: ")
-    
-    # Use automatic settings as requested
-    ref_channel = 1  # Use the 1st channel for reference
-    threshold_method = 'otsu'  # Use Otsu thresholding
-    min_cell_size = 100  # Set minimum cell size to 100
-    use_adaptive = True  # Use adaptive thresholding
-    adaptive_block_size = 35  # Block size = 35
-    use_watershed = True  # Use watershed segmentation
-    watershed_min_distance = 10  # Set minimum distance = 10
-    percentile_low = 0.1  # Lower percentile = 0.1
-    percentile_high = 99.9  # Higher percentile = 99.9
-    
-    print("\nUsing automatic settings:")
-    print(f"  Reference channel: {ref_channel}")
-    print(f"  Threshold method: {threshold_method}")
-    print(f"  Minimum cell size: {min_cell_size} pixels")
-    print(f"  Adaptive thresholding: Enabled (block size {adaptive_block_size})")
-    print(f"  Watershed segmentation: Enabled (min distance {watershed_min_distance})")
-    print(f"  Contrast enhancement: {percentile_low} to {percentile_high} percentiles")
-    print()
-    
-    # Run the segmentation
-    segment_first_frame(tif_path, ref_channel, min_cell_size, 
-                      percentile_low, percentile_high,
-                      threshold_method=threshold_method,
-                      use_adaptive=use_adaptive, 
-                      use_watershed=use_watershed,
-                      watershed_min_distance=watershed_min_distance,
-                      adaptive_block_size=adaptive_block_size)
+    main()

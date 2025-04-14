@@ -899,9 +899,9 @@ if __name__ == "__main__":
     # Use preset parameters
     ref_channel = 1
     meas_channel = 0
-    min_cell_size = 100
+    min_cell_size = 1
     use_adaptive = True
-    adaptive_block_size = 35
+    adaptive_block_size = 5
     use_watershed = True
     watershed_min_distance = 10
     percentile_low = 0.1
