@@ -12,7 +12,7 @@ import warnings
 # Suppress specific warnings that might occur during processing
 warnings.filterwarnings("ignore", category=UserWarning, module="skimage")
 
-def load_first_frame(tiff_path, channel=0):
+def load_first_frame(tiff_path, channel=1):
     """
     Load the first frame from a TIFF file, extracting a specific channel.
     
@@ -132,7 +132,7 @@ def enhance_contrast(image, percentiles=(1, 99), method='adaptive'):
     
     return img
 
-def denoise_image(image, method='tv', sigma=2.0):
+def denoise_image(image, method='gaussian', sigma=2.0):
     """
     Apply denoising to the image.
     
@@ -171,7 +171,7 @@ def denoise_image(image, method='tv', sigma=2.0):
     else:
         return img
 
-def detect_cell_regions(image, method='otsu', min_size=120, max_holes_size=50, threshold_abs=None):
+def detect_cell_regions(image, method='multiotsu', min_size=120, max_holes_size=50, threshold_abs=None):
     """
     Detect foreground cell regions in the image.
     
@@ -346,7 +346,7 @@ def find_cell_markers(image, binary_mask, method='distance', min_distance=15,
     
     return markers
 
-def segment_cells(image, binary_mask, markers, method='watershed'):
+def segment_cells(image, binary_mask, markers, method='random_walker'):
     """
     Segment individual cells based on markers.
     
@@ -402,30 +402,11 @@ def segment_cells(image, binary_mask, markers, method='watershed'):
     
     return labels
 
-def refine_segmentation(labels, image, min_size=120, max_size=5000, 
-                        split_touching=True, border_clearing=False):
+def refine_segmentation(labels, image, min_size=120, max_size=2500,  # reduced max_size
+                        split_touching=True, border_clearing=False,
+                        aggressive_splitting=True):  # new parameter
     """
-    Refine segmentation results by removing small objects, splitting touching cells, etc.
-    
-    Parameters:
-    -----------
-    labels : numpy.ndarray
-        Labeled image with segmented cells
-    image : numpy.ndarray
-        Original input image
-    min_size : int
-        Minimum size of objects to keep
-    max_size : int
-        Maximum size of objects (larger objects will be split)
-    split_touching : bool
-        Whether to attempt splitting of touching cells
-    border_clearing : bool
-        Whether to remove objects touching the border
-        
-    Returns:
-    --------
-    refined_labels : numpy.ndarray
-        Refined labeled image
+    Refine segmentation results with more aggressive splitting of large objects.
     """
     refined_labels = labels.copy()
     
@@ -437,10 +418,11 @@ def refine_segmentation(labels, image, min_size=120, max_size=5000,
         refined_labels = segmentation.clear_border(refined_labels)
     
     if split_touching:
-        # For each label, check if it's too large and try to split it
+        # Get all region properties
         props = measure.regionprops(refined_labels)
         
         for prop in props:
+            # Lower threshold for what's considered "too large"
             if prop.area > max_size:
                 # Get the object mask
                 mask = refined_labels == prop.label
@@ -448,12 +430,21 @@ def refine_segmentation(labels, image, min_size=120, max_size=5000,
                 # Create a distance transform of the mask
                 distance = ndimage.distance_transform_edt(mask)
                 
-                # Apply watershed to split the large object
+                # Use more aggressive parameters for peak detection
+                min_peak_distance = 10 if aggressive_splitting else 15
+                
+                # For larger objects, use even more aggressive parameters
+                if prop.area > max_size * 2:
+                    min_peak_distance = 5
+                
+                # Apply watershed to split the large object with more sensitive parameters
                 local_max = feature.peak_local_max(
                     distance, 
-                    min_distance=15,
+                    min_distance=min_peak_distance,
                     labels=mask,
-                    exclude_border=False
+                    exclude_border=False,
+                    # Add threshold to detect more peaks
+                    threshold_abs=0.3 if aggressive_splitting else 0.5
                 )
                 
                 # If we found multiple peaks, split the object
@@ -467,10 +458,7 @@ def refine_segmentation(labels, image, min_size=120, max_size=5000,
                     local_labels = segmentation.watershed(local_gradient, local_markers, mask=mask)
                     
                     # Update the refined labels
-                    # First, remove the original label
                     refined_labels[mask] = 0
-                    
-                    # Then, add the new labels with appropriate offsets
                     max_label = np.max(refined_labels)
                     for i in range(1, np.max(local_labels) + 1):
                         refined_labels[local_labels == i] = max_label + i
